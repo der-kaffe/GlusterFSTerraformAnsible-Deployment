@@ -1,0 +1,144 @@
+---
+- name: Confiar en las nuevas máquinas virtuales
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: Escanear las huellas criptográficas de los nodos
+      command: "ssh-keyscan -H {{ hostvars[item].ansible_host }}"
+      register: keyscan_results
+      loop: "{{ groups['gluster_nodes'] }}"
+      changed_when: false
+
+    - name: Añadir las huellas al archivo known_hosts local
+      known_hosts:
+        path: ~/.ssh/known_hosts
+        name: "{{ hostvars[item.item].ansible_host }}"
+        key: "{{ item.stdout }}"
+        state: present
+      loop: "{{ keyscan_results.results }}"
+
+
+- name: Preparación de Nodos y Almacenamiento
+  hosts: gluster_nodes
+  become: yes
+  tasks:
+    - name: Actualizar caché de paquetes
+      apt:
+        update_cache: yes
+
+    - name: Instalar dependencias de sistema y GlusterFS
+      apt:
+        name:
+          - glusterfs-server
+          - xfsprogs
+          - parted
+        state: present
+
+    - name: Asegurar que GlusterFS esté corriendo
+      service:
+        name: glusterd
+        state: started
+        enabled: yes
+
+# --- CONFIGURACIÓN DE DISCO ---
+    - name: Verificar si la partición ya existe
+      stat:
+        path: /dev/vdb1
+      register: vdb1_status
+
+    - name: Crear tabla de particiones GPT
+      command: "parted -s /dev/vdb mklabel gpt"
+      when: not vdb1_status.stat.exists
+
+    - name: Crear partición primaria
+      command: "parted -s /dev/vdb mkpart primary xfs 0% 100%"
+      when: not vdb1_status.stat.exists
+
+    - name: Esperar a que aparezca la partición
+      wait_for:
+        path: /dev/vdb1
+        timeout: 10
+      when: not vdb1_status.stat.exists
+
+    - name: Formatear la partición con XFS
+      filesystem:
+        fstype: xfs
+        dev: /dev/vdb1
+
+    - name: Crear directorio base
+      file:
+        path: /data/glusterfs/brick1/brick
+        state: directory
+        mode: '0775'
+
+    - name: Montar el disco
+      mount:
+        path: /data/glusterfs/brick1
+        src: /dev/vdb1
+        fstype: xfs
+        state: mounted
+
+
+- name: Orquestación del Clúster
+  hosts: gluster_primary
+  become: yes
+  tasks:
+    - name: Esperar a que glusterd esté listo
+      wait_for:
+        port: 24007
+        timeout: 30
+
+    - name: Unir nodos al pool (peer probe)
+      command: "gluster peer probe {{ item }}"
+      loop:
+        - 192.168.122.102
+        - 192.168.122.103
+      register: peer_probe
+      failed_when: 
+        - peer_probe.rc != 0
+        - "'already in peer list' not in peer_probe.stdout"
+      changed_when: "'success' in peer_probe.stdout"
+
+    - name: Esperar sincronización de peers
+      pause:
+        seconds: 5
+
+    - name: Crear volumen replicado (Replica 3)
+      command: >
+        gluster volume create vol_shared replica 3
+        192.168.122.101:/data/glusterfs/brick1/brick
+        192.168.122.102:/data/glusterfs/brick1/brick
+        192.168.122.103:/data/glusterfs/brick1/brick
+        force
+      register: vol_create
+      failed_when: 
+        - vol_create.rc != 0
+        - "'already exists' not in vol_create.stderr"
+      changed_when: "'success' in vol_create.stdout"
+
+    - name: Iniciar volumen
+      command: "gluster volume start vol_shared"
+      register: vol_start
+      failed_when: 
+        - vol_start.rc != 0
+        - "'already started' not in vol_start.stderr"
+      changed_when: "'success' in vol_start.stdout"
+- name: Configurar Cliente GlusterFS en los Nodos
+  hosts: gluster_nodes
+  become: yes
+  tasks:
+    - name: Crear el punto de montaje local
+      file:
+        path: /mnt/gluster_compartido
+        state: directory
+        mode: '0775'
+
+    - name: Montar el volumen distribuido
+      mount:
+        path: /mnt/gluster_compartido
+        # Usamos la IP del Nodo 1 como punto de entrada al clúster
+        src: "192.168.122.101:/vol_shared"
+        fstype: glusterfs
+        state: mounted
+        opts: "defaults,_netdev" # _netdev indica que espere a que la red esté lista antes de montar
